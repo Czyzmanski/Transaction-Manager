@@ -106,8 +106,8 @@ public class TransactionManagerImpl implements TransactionManager {
                 resrcOwnerSem.release();
 
                 syncSem.acquire();
-                detectDeadlock(currentThread, resrcOwner);
                 threadToAwaitedResrc.put(currentThread, rid);
+                detectDeadlock(currentThread, resrcOwner);
                 syncSem.release();
 
                 resrcTranSem.acquire();
@@ -118,9 +118,51 @@ public class TransactionManagerImpl implements TransactionManager {
         }
     }
 
-    private void detectDeadlock(Thread currentThread, Thread resrcOwner) {
-        List<Thread> owners = new ArrayList<>();
+    private Thread getThreadToAbort(List<Thread> owners) {
+        return owners.stream()
+                     .max((t1, t2) -> {
+                         long t1TranStartTime = threadToTranStartTime.get(t1);
+                         long t2TranStartTime = threadToTranStartTime.get(t2);
 
+                         if (t1TranStartTime == t2TranStartTime) {
+                             return Long.compare(t1.getId(), t2.getId());
+                         } else {
+                             return Long.compare(t1TranStartTime, t2TranStartTime);
+                         }
+                     })
+                     .get();
+    }
+
+    private void detectDeadlock(Thread currentThread, Thread next) {
+        List<Thread> owners = new ArrayList<>();
+        owners.add(currentThread);
+
+        if (isDeadlock(currentThread, next, owners)) {
+            Thread threadToAbort = getThreadToAbort(owners);
+            abortedThreads.add(threadToAbort);
+            threadToAbort.interrupt();
+        }
+    }
+
+    private boolean isDeadlock(Thread currentThread, Thread next, List<Thread> owners) {
+        Set<ResourceId> currentThreadResrc = threadToOpResrc.get(currentThread);
+
+        boolean deadlock = false;
+        while (true) {
+            if (!threadToAwaitedResrc.containsKey(next) || abortedThreads.contains(next)) {
+                break;
+            }
+            owners.add(next);
+            ResourceId awaitedResrc = threadToAwaitedResrc.get(next);
+            if (currentThreadResrc.contains(awaitedResrc)) {
+                deadlock = true;
+                break;
+            } else {
+                next = resourceIdToThread.get(awaitedResrc);
+            }
+        }
+
+        return deadlock;
     }
 
     private void useResource(ResourceId rid, ResourceOperation operation, Thread currentThread,
@@ -149,7 +191,8 @@ public class TransactionManagerImpl implements TransactionManager {
         } else if (isTransactionAborted()) {
             throw new ActiveTransactionAborted();
         } else {
-            freeTransactionResources();
+            freeTransactionResources(threadToOpResrcSeq.getOrDefault(Thread.currentThread(),
+                                                                     new ConcurrentLinkedDeque<>()));
         }
     }
 
@@ -159,20 +202,18 @@ public class TransactionManagerImpl implements TransactionManager {
         Deque<TransactionOperation> opResrcSeq =
                 threadToOpResrcSeq.getOrDefault(currentThread, new ConcurrentLinkedDeque<>());
 
-        if (opResrcSeq.size() > 0) {
-            try {
-                syncSem.acquire();
-                threadToAwaitedResrc.remove(currentThread);
-                syncSem.release();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-                currentThread.interrupt();
-                return;
-            }
-
-            undoTransactionOperations(opResrcSeq);
-            freeTransactionResources();
+        try {
+            syncSem.acquire();
+            threadToAwaitedResrc.remove(currentThread);
+            syncSem.release();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+            currentThread.interrupt();
+            return;
         }
+
+        undoTransactionOperations(opResrcSeq);
+        freeTransactionResources(opResrcSeq);
     }
 
     @Override
@@ -208,10 +249,9 @@ public class TransactionManagerImpl implements TransactionManager {
         resrcTranSem.release();
     }
 
-    private void freeTransactionResources() {
+    private void freeTransactionResources(Deque<TransactionOperation> opResrcSeq) {
         Thread currentThread = Thread.currentThread();
         Set<ResourceId> opResrc = threadToOpResrc.get(currentThread);
-        Deque<TransactionOperation> opResrcSeq = threadToOpResrcSeq.get(currentThread);
 
         while (opResrcSeq.size() > 0) {
             TransactionOperation ridOp = opResrcSeq.removeLast();
