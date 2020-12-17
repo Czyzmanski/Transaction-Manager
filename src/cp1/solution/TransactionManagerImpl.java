@@ -76,22 +76,22 @@ public class TransactionManagerImpl implements TransactionManager {
         } else {
             Thread currentThread = Thread.currentThread();
 
+            Semaphore resrcTranSem = ridToTranSem.get(rid);
             Semaphore resrcOwnerSem = ridToSem.get(rid);
             resrcOwnerSem.acquire();
-
-            Semaphore resrcTranSem = ridToTranSem.get(rid);
 
             if (currentThread.equals(ridToOwner.getOrDefault(rid, currentThread))) {
                 if (!ridToOwner.containsKey(rid)) {
                     resrcTranSem.acquire();
                 }
+                ridToOwner.put(rid, currentThread);
+                resrcOwnerSem.release();
             } else {
-                Thread resrcOwner = ridToOwner.get(rid);
                 resrcOwnerSem.release();
 
                 syncSem.acquire();
                 threadToAwaitedResrc.put(currentThread, rid);
-                detectDeadlock(currentThread, resrcOwner);
+                detectDeadlock(currentThread, ridToOwner.get(rid));
                 syncSem.release();
 
                 resrcTranSem.acquire();
@@ -153,6 +153,7 @@ public class TransactionManagerImpl implements TransactionManager {
     private void useResource(ResourceId rid, ResourceOperation operation, Thread currentThread,
                              Semaphore resrcOwnerSem)
             throws ResourceOperationException, InterruptedException {
+        resrcOwnerSem.acquire();
         ridToOwner.put(rid, currentThread);
         resrcOwnerSem.release();
 
@@ -211,29 +212,26 @@ public class TransactionManagerImpl implements TransactionManager {
         return ridToResrc.containsKey(rid);
     }
 
-    private void freeResource(TransactionOperation ridOp) {
-        Semaphore resrcOwnerSem = ridToSem.get(ridOp.rid);
-        resrcOwnerSem.acquireUninterruptibly();
-
-        ridToOwner.remove(ridOp.rid);
-
-        Semaphore resrcTranSem = ridToTranSem.get(ridOp.rid);
-        if (!resrcTranSem.hasQueuedThreads()) {
-            resrcOwnerSem.release();
-        }
+    private void freeResource(ResourceId rid) {
+        Semaphore resrcTranSem = ridToTranSem.get(rid);
         resrcTranSem.release();
     }
 
     private void freeTransactionResources(Deque<TransactionOperation> opResrcSeq) {
         Thread currentThread = Thread.currentThread();
-        Set<ResourceId> opResrc = threadToOpResrc.get(currentThread);
+        Set<ResourceId> opResrc = threadToOpResrc.getOrDefault(currentThread,
+                                                               new ConcurrentSkipListSet<>());
 
         while (opResrcSeq.size() > 0) {
             TransactionOperation ridOp = opResrcSeq.removeLast();
             if (opResrc.contains(ridOp.rid)) {
-                freeResource(ridOp);
+                freeResource(ridOp.rid);
                 opResrc.remove(ridOp.rid);
             }
+        }
+
+        for (ResourceId rid : opResrc) {
+            freeResource(rid);
         }
 
         abortedThreads.remove(currentThread);
