@@ -63,6 +63,16 @@ public class TransactionManagerImpl implements TransactionManager {
         }
     }
 
+    private void handleInterruptedException(InterruptedException e)
+            throws ActiveTransactionAborted, InterruptedException {
+        if (isTransactionAborted()) {
+            throw new ActiveTransactionAborted();
+        } else {
+            Thread.currentThread().interrupt();
+            throw e;
+        }
+    }
+
     @Override
     public void operateOnResourceInCurrentTransaction(ResourceId rid, ResourceOperation operation)
             throws NoActiveTransactionException, UnknownResourceIdException,
@@ -81,11 +91,16 @@ public class TransactionManagerImpl implements TransactionManager {
             resrcOwnerSem.acquire();
 
             if (currentThread.equals(ridToOwner.getOrDefault(rid, currentThread))) {
-                if (!ridToOwner.containsKey(rid)) {
-                    resrcTranSem.acquire();
+                try {
+                    if (!ridToOwner.containsKey(rid)) {
+                        resrcTranSem.acquire();
+                    }
+                    ridToOwner.put(rid, currentThread);
+                } catch (InterruptedException e) {
+                    handleInterruptedException(e);
+                } finally {
+                    resrcOwnerSem.release();
                 }
-                ridToOwner.put(rid, currentThread);
-                resrcOwnerSem.release();
             } else {
                 resrcOwnerSem.release();
 
@@ -94,7 +109,11 @@ public class TransactionManagerImpl implements TransactionManager {
                 detectDeadlock(currentThread, ridToOwner.get(rid));
                 syncSem.release();
 
-                resrcTranSem.acquire();
+                try {
+                    resrcTranSem.acquire();
+                } catch (InterruptedException e) {
+                    handleInterruptedException(e);
+                }
             }
 
             useResource(rid, operation, currentThread, resrcOwnerSem);
@@ -153,22 +172,29 @@ public class TransactionManagerImpl implements TransactionManager {
     private void useResource(ResourceId rid, ResourceOperation operation, Thread currentThread,
                              Semaphore resrcOwnerSem)
             throws ResourceOperationException, InterruptedException {
-        resrcOwnerSem.acquire();
-        ridToOwner.put(rid, currentThread);
-        resrcOwnerSem.release();
+        threadToOpResrc.get(currentThread)
+                       .add(rid);
 
         if (threadToAwaitedResrc.containsKey(currentThread)) {
-            syncSem.acquire();
+            syncSem.acquireUninterruptibly();
             threadToAwaitedResrc.remove(currentThread);
             syncSem.release();
         }
 
-        threadToOpResrc.get(currentThread)
-                       .add(rid);
+        resrcOwnerSem.acquire();
+        ridToOwner.put(rid, currentThread);
+        resrcOwnerSem.release();
+
         ridToResrc.get(rid)
                   .apply(operation);
-        threadToOpResrcSeq.get(currentThread)
-                          .addLast(new TransactionOperation(rid, operation));
+
+        if (currentThread.isInterrupted()) {
+            ridToResrc.get(rid)
+                      .unapply(operation);
+        } else {
+            threadToOpResrcSeq.get(currentThread)
+                              .addLast(new TransactionOperation(rid, operation));
+        }
     }
 
     @Override
