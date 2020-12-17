@@ -19,17 +19,11 @@ public class TransactionManagerImpl implements TransactionManager {
 
     }
 
-    private static final Comparator<Thread> THREADS_COMPARATOR;
-
-    static {
-        THREADS_COMPARATOR = (t1, t2) -> Long.compare(t1.getId(), t2.getId());
-    }
-
     private final Semaphore syncSem;
-    private final ConcurrentMap<ResourceId, Resource> resourceIdToResource;
-    private final ConcurrentMap<ResourceId, Thread> resourceIdToThread;
-    private final ConcurrentMap<ResourceId, Semaphore> resourceIdToSem;
-    private final ConcurrentMap<ResourceId, Semaphore> resourceIdToTranSem;
+    private final ConcurrentMap<ResourceId, Resource> ridToResrc;
+    private final ConcurrentMap<ResourceId, Thread> ridToOwner;
+    private final ConcurrentMap<ResourceId, Semaphore> ridToSem;
+    private final ConcurrentMap<ResourceId, Semaphore> ridToTranSem;
     private final ConcurrentMap<Thread, Set<ResourceId>> threadToOpResrc;
     private final ConcurrentMap<Thread, Deque<TransactionOperation>> threadToOpResrcSeq;
     private final ConcurrentMap<Thread, ResourceId> threadToAwaitedResrc;
@@ -40,30 +34,18 @@ public class TransactionManagerImpl implements TransactionManager {
     public TransactionManagerImpl(Collection<Resource> resources,
                                   LocalTimeProvider timeProvider) {
         syncSem = new Semaphore(1, true);
-
-        resourceIdToResource = new ConcurrentSkipListMap<>();
-        resources.forEach(resource -> resourceIdToResource.put(resource.getId(), resource));
-
-        resourceIdToThread = new ConcurrentSkipListMap<>();
-
-        resourceIdToSem = new ConcurrentSkipListMap<>();
-        resources.forEach(
-                resource -> resourceIdToSem.put(resource.getId(), new Semaphore(1, true)));
-
-        resourceIdToTranSem = new ConcurrentSkipListMap<>();
-        resources.forEach(
-                resource -> resourceIdToTranSem.put(resource.getId(), new Semaphore(1, true)));
-
+        ridToResrc = new ConcurrentSkipListMap<>();
+        resources.forEach(resource -> ridToResrc.put(resource.getId(), resource));
+        ridToOwner = new ConcurrentSkipListMap<>();
+        ridToSem = new ConcurrentSkipListMap<>();
+        resources.forEach(resource -> ridToSem.put(resource.getId(), new Semaphore(1, true)));
+        ridToTranSem = new ConcurrentSkipListMap<>();
+        resources.forEach(resource -> ridToTranSem.put(resource.getId(), new Semaphore(1, true)));
         threadToOpResrc = new ConcurrentHashMap<>();
-
         threadToOpResrcSeq = new ConcurrentHashMap<>();
-
         threadToAwaitedResrc = new ConcurrentHashMap<>();
-
         threadToTranStartTime = new ConcurrentHashMap<>();
-
-        abortedThreads = new ConcurrentSkipListSet<>(THREADS_COMPARATOR);
-
+        abortedThreads = new ConcurrentSkipListSet<>(Comparator.comparingLong(Thread::getId));
         this.timeProvider = timeProvider;
     }
 
@@ -73,6 +55,8 @@ public class TransactionManagerImpl implements TransactionManager {
             throw new AnotherTransactionActiveException();
         } else {
             Thread currentThread = Thread.currentThread();
+
+            abortedThreads.remove(currentThread);
             threadToOpResrc.put(currentThread, new ConcurrentSkipListSet<>());
             threadToOpResrcSeq.put(currentThread, new ConcurrentLinkedDeque<>());
             threadToTranStartTime.put(currentThread, timeProvider.getTime());
@@ -92,17 +76,17 @@ public class TransactionManagerImpl implements TransactionManager {
         } else {
             Thread currentThread = Thread.currentThread();
 
-            Semaphore resrcOwnerSem = resourceIdToSem.get(rid);
+            Semaphore resrcOwnerSem = ridToSem.get(rid);
             resrcOwnerSem.acquire();
 
-            Semaphore resrcTranSem = resourceIdToTranSem.get(rid);
+            Semaphore resrcTranSem = ridToTranSem.get(rid);
 
-            if (currentThread.equals(resourceIdToThread.getOrDefault(rid, currentThread))) {
-                if (!resourceIdToThread.containsKey(rid)) {
+            if (currentThread.equals(ridToOwner.getOrDefault(rid, currentThread))) {
+                if (!ridToOwner.containsKey(rid)) {
                     resrcTranSem.acquire();
                 }
             } else {
-                Thread resrcOwner = resourceIdToThread.get(rid);
+                Thread resrcOwner = ridToOwner.get(rid);
                 resrcOwnerSem.release();
 
                 syncSem.acquire();
@@ -114,7 +98,6 @@ public class TransactionManagerImpl implements TransactionManager {
             }
 
             useResource(rid, operation, currentThread, resrcOwnerSem);
-            resrcTranSem.release();
         }
     }
 
@@ -152,13 +135,15 @@ public class TransactionManagerImpl implements TransactionManager {
             if (!threadToAwaitedResrc.containsKey(next) || abortedThreads.contains(next)) {
                 break;
             }
+
             owners.add(next);
+
             ResourceId awaitedResrc = threadToAwaitedResrc.get(next);
             if (currentThreadResrc.contains(awaitedResrc)) {
                 deadlock = true;
                 break;
             } else {
-                next = resourceIdToThread.get(awaitedResrc);
+                next = ridToOwner.get(awaitedResrc);
             }
         }
 
@@ -168,17 +153,19 @@ public class TransactionManagerImpl implements TransactionManager {
     private void useResource(ResourceId rid, ResourceOperation operation, Thread currentThread,
                              Semaphore resrcOwnerSem)
             throws ResourceOperationException, InterruptedException {
-        resourceIdToThread.put(rid, currentThread);
-
-        syncSem.acquire();
-        threadToAwaitedResrc.remove(currentThread);
-        syncSem.release();
+        ridToOwner.put(rid, currentThread);
         resrcOwnerSem.release();
+
+        if (threadToAwaitedResrc.containsKey(currentThread)) {
+            syncSem.acquire();
+            threadToAwaitedResrc.remove(currentThread);
+            syncSem.release();
+        }
 
         threadToOpResrc.get(currentThread)
                        .add(rid);
-        resourceIdToResource.get(rid)
-                            .apply(operation);
+        ridToResrc.get(rid)
+                  .apply(operation);
         threadToOpResrcSeq.get(currentThread)
                           .addLast(new TransactionOperation(rid, operation));
     }
@@ -202,15 +189,9 @@ public class TransactionManagerImpl implements TransactionManager {
         Deque<TransactionOperation> opResrcSeq =
                 threadToOpResrcSeq.getOrDefault(currentThread, new ConcurrentLinkedDeque<>());
 
-        try {
-            syncSem.acquire();
-            threadToAwaitedResrc.remove(currentThread);
-            syncSem.release();
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-            currentThread.interrupt();
-            return;
-        }
+        syncSem.acquireUninterruptibly();
+        threadToAwaitedResrc.remove(currentThread);
+        syncSem.release();
 
         undoTransactionOperations(opResrcSeq);
         freeTransactionResources(opResrcSeq);
@@ -218,7 +199,7 @@ public class TransactionManagerImpl implements TransactionManager {
 
     @Override
     public boolean isTransactionActive() {
-        return !isTransactionAborted() && threadToOpResrcSeq.containsKey(Thread.currentThread());
+        return threadToOpResrcSeq.containsKey(Thread.currentThread());
     }
 
     @Override
@@ -227,22 +208,16 @@ public class TransactionManagerImpl implements TransactionManager {
     }
 
     private boolean isKnownResourceId(ResourceId rid) {
-        return resourceIdToResource.containsKey(rid);
+        return ridToResrc.containsKey(rid);
     }
 
-    private void freeResource(Thread currentThread, TransactionOperation ridOp) {
-        Semaphore resrcOwnerSem = resourceIdToSem.get(ridOp.rid);
-        try {
-            resrcOwnerSem.acquire();
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-            currentThread.interrupt();
-            return;
-        }
+    private void freeResource(TransactionOperation ridOp) {
+        Semaphore resrcOwnerSem = ridToSem.get(ridOp.rid);
+        resrcOwnerSem.acquireUninterruptibly();
 
-        resourceIdToThread.remove(ridOp.rid);
+        ridToOwner.remove(ridOp.rid);
 
-        Semaphore resrcTranSem = resourceIdToTranSem.get(ridOp.rid);
+        Semaphore resrcTranSem = ridToTranSem.get(ridOp.rid);
         if (!resrcTranSem.hasQueuedThreads()) {
             resrcOwnerSem.release();
         }
@@ -256,11 +231,12 @@ public class TransactionManagerImpl implements TransactionManager {
         while (opResrcSeq.size() > 0) {
             TransactionOperation ridOp = opResrcSeq.removeLast();
             if (opResrc.contains(ridOp.rid)) {
-                freeResource(currentThread, ridOp);
+                freeResource(ridOp);
                 opResrc.remove(ridOp.rid);
             }
         }
 
+        abortedThreads.remove(currentThread);
         threadToOpResrc.remove(currentThread);
         threadToOpResrcSeq.remove(currentThread);
         threadToTranStartTime.remove(currentThread);
@@ -271,7 +247,7 @@ public class TransactionManagerImpl implements TransactionManager {
         Collections.reverse(tmpOpResrcSeq);
 
         for (TransactionOperation ridOp : tmpOpResrcSeq) {
-            Resource resource = resourceIdToResource.get(ridOp.rid);
+            Resource resource = ridToResrc.get(ridOp.rid);
             resource.unapply(ridOp.operation);
         }
     }
